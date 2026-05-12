@@ -36,7 +36,23 @@ app.post("/webhook", async (req, res) => {
         if (event.pass_thread_control || event.take_thread_control) {
           const type = event.pass_thread_control ? "pass_thread_control" : "take_thread_control";
           console.log(`🚨 Handoff (${type})! Customer:`, event.sender?.id);
-          await handleMetaAIHandoff(event);
+          await handleMetaAIHandoff(event.sender.id);
+        }
+
+        // Detect Meta AI handoff via message echo
+        // Meta AI sends "I'll transfer you" message → we receive an echo of it
+        if (event.message?.is_echo) {
+          const text = event.message.text || "";
+          const isHandoff =
+            text.includes("سأقوم بتوصيلك") ||
+            text.includes("بأحد ممثلي") ||
+            text.includes("I'll connect you") ||
+            text.includes("transfer you to");
+          if (isHandoff) {
+            const customerId = event.recipient?.id;
+            console.log("🚨 Meta AI handoff detected via echo! Customer:", customerId);
+            await handleMetaAIHandoff(customerId);
+          }
         }
       }
     }
@@ -45,8 +61,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-async function handleMetaAIHandoff(event) {
-  const customerId = event.sender.id;
+async function handleMetaAIHandoff(customerId) {
   try {
     const history = await getConversationHistory(customerId);
     await sendDiscordNotification(customerId, history);
