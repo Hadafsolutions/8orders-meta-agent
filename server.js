@@ -3,6 +3,8 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
+app.get("/", (_req, res) => res.status(200).send("OK"));
+
 const CONFIG = {
   VERIFY_TOKEN: process.env.VERIFY_TOKEN || "8orders_meta_verify_2024",
   PAGE_ACCESS_TOKEN: process.env.PAGE_ACCESS_TOKEN,
@@ -94,6 +96,6 @@ async function sendDiscordNotification(customerId, { profile, messages }) {
   });
 }
 
-app.listen(CONFIG.PORT, () => {
+app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log(`🚀 8Orders webhook server running on port ${CONFIG.PORT}`);
 });
