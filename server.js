@@ -5,10 +5,10 @@ app.use(express.json());
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const CONFIG = {
-  VERIFY_TOKEN: "8orders_meta_verify_2024",       // Any string — must match Meta dashboard
-  PAGE_ACCESS_TOKEN: "YOUR_PAGE_ACCESS_TOKEN",     // From Meta App dashboard
+  VERIFY_TOKEN: process.env.VERIFY_TOKEN || "8orders_meta_verify_2024",
+  PAGE_ACCESS_TOKEN: process.env.PAGE_ACCESS_TOKEN,
   DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1503757935199649904/goqYQiQnbPrEV4x4A8HRDwIdsO2361Cl3f2khuUTZ3G48j3pa9hFiUVz_irqlRZ4SHPc",
-  PORT: 3000,
+  PORT: process.env.PORT || 3000,
 };
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -30,13 +30,20 @@ app.get("/webhook", (req, res) => {
 app.post("/webhook", async (req, res) => {
   const body = req.body;
 
+  console.log("📨 Webhook received:", JSON.stringify(body, null, 2));
+
   if (body.object !== "page") return res.sendStatus(404);
 
   for (const entry of body.entry) {
-    for (const event of entry.messaging) {
+    // messaging_handovers come in entry.messaging, standby events in entry.standby
+    const events = entry.messaging || entry.standby || [];
+
+    for (const event of events) {
+      console.log("📩 Event keys:", Object.keys(event).join(", "));
+
       // 🔑 This is the trigger: Meta AI couldn't respond and is handing off
       if (event.pass_thread_control) {
-        console.log("🚨 Handoff detected from Meta AI");
+        console.log("🚨 Handoff detected! Customer:", event.sender?.id);
         await handleMetaAIHandoff(event);
       }
     }
@@ -130,7 +137,7 @@ async function sendDiscordNotification(customerId, { profile, messages }, event)
         title: "🚨 عميل محتاج مساعدة بشرية",
         description:
           "Meta AI مش قادر يرد على العميل ده — محتاج تدخل يدوي",
-        color: 0xff4444, // Red
+        color: 0xff4444,
         fields: [
           {
             name: "👤 العميل",
