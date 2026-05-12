@@ -25,18 +25,22 @@ app.get("/webhook", (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   res.status(200).send("EVENT_RECEIVED");
-  const body = req.body;
-  console.log("📨 Webhook received:", JSON.stringify(body, null, 2));
-  if (body.object !== "page") return;
-  for (const entry of body.entry) {
-    const events = entry.messaging || entry.standby || [];
-    for (const event of events) {
-      console.log("📩 Event keys:", Object.keys(event).join(", "));
-      if (event.pass_thread_control) {
-        console.log("🚨 Handoff! Customer:", event.sender?.id);
-        await handleMetaAIHandoff(event);
+  try {
+    const body = req.body;
+    console.log("📨 Webhook received:", JSON.stringify(body, null, 2));
+    if (!body || body.object !== "page") return;
+    for (const entry of body.entry || []) {
+      const events = entry.messaging || entry.standby || [];
+      for (const event of events) {
+        console.log("📩 Event keys:", Object.keys(event).join(", "));
+        if (event.pass_thread_control) {
+          console.log("🚨 Handoff! Customer:", event.sender?.id);
+          await handleMetaAIHandoff(event);
+        }
       }
     }
+  } catch (err) {
+    console.error("❌ Unhandled webhook error:", err.message, err.stack);
   }
 });
 
@@ -95,6 +99,10 @@ async function sendDiscordNotification(customerId, { profile, messages }) {
     }],
   });
 }
+
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ Unhandled rejection:", reason);
+});
 
 app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log(`🚀 8Orders webhook server running on port ${CONFIG.PORT}`);
