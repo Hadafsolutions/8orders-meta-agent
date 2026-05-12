@@ -33,8 +33,9 @@ app.post("/webhook", async (req, res) => {
       const events = entry.messaging || entry.standby || [];
       for (const event of events) {
         console.log("📩 Event keys:", Object.keys(event).join(", "));
-        if (event.pass_thread_control) {
-          console.log("🚨 Handoff! Customer:", event.sender?.id);
+        if (event.pass_thread_control || event.take_thread_control) {
+          const type = event.pass_thread_control ? "pass_thread_control" : "take_thread_control";
+          console.log(`🚨 Handoff (${type})! Customer:`, event.sender?.id);
           await handleMetaAIHandoff(event);
         }
       }
