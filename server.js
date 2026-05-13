@@ -10,7 +10,26 @@ const CONFIG = {
   PAGE_ACCESS_TOKEN: process.env.PAGE_ACCESS_TOKEN,
   DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1503757935199649904/goqYQiQnbPrEV4x4A8HRDwIdsO2361Cl3f2khuUTZ3G48j3pa9hFiUVz_irqlRZ4SHPc",
   PORT: process.env.PORT || 3000,
+  POLL_INTERVAL_MS: 60 * 1000, // poll every 60 seconds
 };
+
+// Arabic phrases Meta AI uses when handing off to a human
+const HANDOFF_KEYWORDS = [
+  "سأقوم بتوصيلك",
+  "بأحد ممثلي",
+  "الدعم الفني",
+  "خدمة العملاء",
+  "سأحولك",
+  "تحويلك",
+];
+
+// Track notified conversations to avoid duplicate Discord pings
+// Map<conversationId, timestamp>
+const notifiedConversations = new Map();
+
+let PAGE_ID = null;
+
+// ─── Webhook verification ────────────────────────────────────────────────────
 
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -23,6 +42,8 @@ app.get("/webhook", (req, res) => {
   }
 });
 
+// ─── Webhook receiver (kept as fallback for standard handover events) ────────
+
 app.post("/webhook", async (req, res) => {
   res.status(200).send("EVENT_RECEIVED");
   try {
@@ -33,24 +54,21 @@ app.post("/webhook", async (req, res) => {
       const events = entry.messaging || entry.standby || [];
       for (const event of events) {
         console.log("📩 Event keys:", Object.keys(event).join(", "));
+
+        // Standard Handover Protocol events
         if (event.pass_thread_control || event.take_thread_control) {
           const type = event.pass_thread_control ? "pass_thread_control" : "take_thread_control";
           console.log(`🚨 Handoff (${type})! Customer:`, event.sender?.id);
           await handleMetaAIHandoff(event.sender.id);
         }
 
-        // Detect Meta AI handoff via message echo
-        // Meta AI sends "I'll transfer you" message → we receive an echo of it
+        // Message echo from Meta AI (backup detection)
         if (event.message?.is_echo) {
           const text = event.message.text || "";
-          const isHandoff =
-            text.includes("سأقوم بتوصيلك") ||
-            text.includes("بأحد ممثلي") ||
-            text.includes("I'll connect you") ||
-            text.includes("transfer you to");
+          const isHandoff = HANDOFF_KEYWORDS.some((kw) => text.includes(kw));
           if (isHandoff) {
             const customerId = event.recipient?.id;
-            console.log("🚨 Meta AI handoff detected via echo! Customer:", customerId);
+            console.log("🚨 Handoff via echo! Customer:", customerId);
             await handleMetaAIHandoff(customerId);
           }
         }
@@ -60,6 +78,82 @@ app.post("/webhook", async (req, res) => {
     console.error("❌ Unhandled webhook error:", err.message, err.stack);
   }
 });
+
+// ─── Polling: detect Meta AI handoffs via Graph API ──────────────────────────
+
+async function initPageId() {
+  try {
+    const res = await axios.get("https://graph.facebook.com/v19.0/me", {
+      params: { fields: "id,name", access_token: CONFIG.PAGE_ACCESS_TOKEN },
+    });
+    PAGE_ID = res.data.id;
+    console.log(`📄 Page ready: ${res.data.name} (ID: ${PAGE_ID})`);
+  } catch (err) {
+    console.error("❌ Could not fetch page ID:", err.response?.data || err.message);
+  }
+}
+
+async function pollForHandoffs() {
+  if (!PAGE_ID) return;
+  try {
+    const res = await axios.get("https://graph.facebook.com/v19.0/me/conversations", {
+      params: {
+        fields: "id,messages.limit(10){message,from,created_time}",
+        access_token: CONFIG.PAGE_ACCESS_TOKEN,
+        limit: 25,
+      },
+    });
+
+    const conversations = res.data?.data || [];
+    const now = Date.now();
+
+    // Remove stale entries (older than 2 hours) to allow re-notification
+    for (const [id, ts] of notifiedConversations) {
+      if (now - ts > 2 * 60 * 60 * 1000) notifiedConversations.delete(id);
+    }
+
+    for (const convo of conversations) {
+      // Messages arrive newest-first; reverse to get chronological order
+      const messages = (convo.messages?.data || []).slice().reverse();
+      if (messages.length === 0) continue;
+
+      const latestMsg = messages[messages.length - 1];
+      const latestMsgAge = now - new Date(latestMsg.created_time).getTime();
+
+      // Only look at conversations active in the last 10 minutes
+      if (latestMsgAge > 10 * 60 * 1000) continue;
+
+      // Skip if we already notified for this conversation recently
+      if (notifiedConversations.has(convo.id)) continue;
+
+      // Find the most recent message sent BY THE PAGE (Meta AI)
+      const pageMessages = messages.filter((m) => m.from?.id === PAGE_ID);
+      if (pageMessages.length === 0) continue;
+      const lastPageMsg = pageMessages[pageMessages.length - 1];
+
+      // Only care if that page message was recent (last 5 minutes)
+      const lastPageMsgAge = now - new Date(lastPageMsg.created_time).getTime();
+      if (lastPageMsgAge > 5 * 60 * 1000) continue;
+
+      // Check if it contains a handoff phrase
+      const isHandoff = HANDOFF_KEYWORDS.some((kw) => lastPageMsg.message?.includes(kw));
+      if (!isHandoff) continue;
+
+      // Find the customer (first sender who is not the page)
+      const customerMsg = messages.find((m) => m.from?.id !== PAGE_ID);
+      const customerId = customerMsg?.from?.id;
+      if (!customerId) continue;
+
+      console.log(`🔍 Poll detected handoff — customer: ${customerId}, convo: ${convo.id}`);
+      notifiedConversations.set(convo.id, now);
+      await handleMetaAIHandoff(customerId);
+    }
+  } catch (err) {
+    console.error("❌ Poll error:", err.response?.data || err.message);
+  }
+}
+
+// ─── Core logic ──────────────────────────────────────────────────────────────
 
 async function handleMetaAIHandoff(customerId) {
   try {
@@ -116,10 +210,17 @@ async function sendDiscordNotification(customerId, { profile, messages }) {
   });
 }
 
+// ─── Start ───────────────────────────────────────────────────────────────────
+
 process.on("unhandledRejection", (reason) => {
   console.error("❌ Unhandled rejection:", reason);
 });
 
-app.listen(CONFIG.PORT, "0.0.0.0", () => {
+app.listen(CONFIG.PORT, "0.0.0.0", async () => {
   console.log(`🚀 8Orders webhook server running on port ${CONFIG.PORT}`);
+  await initPageId();
+  // Start polling immediately, then repeat every 60 seconds
+  await pollForHandoffs();
+  setInterval(pollForHandoffs, CONFIG.POLL_INTERVAL_MS);
+  console.log(`🔍 Polling for Meta AI handoffs every ${CONFIG.POLL_INTERVAL_MS / 1000}s`);
 });
