@@ -105,6 +105,55 @@ async function pruneLocalFallback() {
 
 let PAGE_ID = null;
 
+// ─── Debug / test endpoints ──────────────────────────────────────────────────
+
+app.get("/test-discord", async (_req, res) => {
+  try {
+    await axios.post(CONFIG.DISCORD_WEBHOOK_URL, {
+      username: "8Orders AI Agent",
+      embeds: [{
+        title: "🧪 Test notification",
+        description: "Manual test — server → Discord pipeline is working",
+        color: 0x00cc44,
+        fields: [
+          { name: "📄 Page ID", value: PAGE_ID || "not loaded yet", inline: true },
+          { name: "💾 Storage", value: USE_REDIS ? "Upstash Redis ✅" : "local /tmp ⚠️", inline: true },
+        ],
+        timestamp: new Date().toISOString(),
+      }],
+    });
+    res.status(200).send("✅ Test notification sent to Discord");
+  } catch (err) {
+    res.status(500).send(`❌ Failed: ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`);
+  }
+});
+
+app.get("/debug-poll", async (_req, res) => {
+  if (!PAGE_ID) return res.status(500).send("❌ PAGE_ID not loaded — check PAGE_ACCESS_TOKEN");
+  try {
+    const result = await axios.get("https://graph.facebook.com/v19.0/me/conversations", {
+      params: {
+        fields: "id,messages.limit(5){message,from,created_time}",
+        access_token: CONFIG.PAGE_ACCESS_TOKEN,
+        limit: 10,
+      },
+    });
+    const convos = result.data?.data || [];
+    const now = Date.now();
+    const report = convos.map(c => {
+      const msgs = (c.messages?.data || []).slice().reverse();
+      const latest = msgs[msgs.length - 1];
+      const age = latest ? Math.round((now - new Date(latest.created_time).getTime()) / 1000) : null;
+      const pageMsg = msgs.filter(m => m.from?.id === PAGE_ID).pop();
+      const handoff = HANDOFF_KEYWORDS.some(kw => pageMsg?.message?.includes(kw));
+      return { id: c.id, msgs: msgs.length, latestAge: `${age}s`, lastPageMsg: pageMsg?.message?.substring(0, 60) || null, handoff };
+    });
+    res.json({ pageId: PAGE_ID, conversations: report });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
 // ─── Webhook verification ────────────────────────────────────────────────────
 
 app.get("/webhook", (req, res) => {
