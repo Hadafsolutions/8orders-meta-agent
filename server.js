@@ -112,6 +112,8 @@ async function pollForHandoffs() {
       if (now - ts > 2 * 60 * 60 * 1000) notifiedConversations.delete(id);
     }
 
+    console.log(`🔄 Poll: checking ${conversations.length} conversations`);
+
     for (const convo of conversations) {
       // Messages arrive newest-first; reverse to get chronological order
       const messages = (convo.messages?.data || []).slice().reverse();
@@ -123,20 +125,33 @@ async function pollForHandoffs() {
       // Only look at conversations active in the last 10 minutes
       if (latestMsgAge > 10 * 60 * 1000) continue;
 
+      console.log(`  📬 Active convo ${convo.id} — ${messages.length} msgs, latest ${Math.round(latestMsgAge/1000)}s ago`);
+
       // Skip if we already notified for this conversation recently
-      if (notifiedConversations.has(convo.id)) continue;
+      if (notifiedConversations.has(convo.id)) {
+        console.log(`  ⏭ Already notified`);
+        continue;
+      }
 
       // Find the most recent message sent BY THE PAGE (Meta AI)
       const pageMessages = messages.filter((m) => m.from?.id === PAGE_ID);
-      if (pageMessages.length === 0) continue;
+      if (pageMessages.length === 0) {
+        console.log(`  ℹ No page messages found`);
+        continue;
+      }
       const lastPageMsg = pageMessages[pageMessages.length - 1];
+      console.log(`  📝 Last page msg (${Math.round((now - new Date(lastPageMsg.created_time).getTime())/1000)}s ago): "${lastPageMsg.message?.substring(0, 80)}"`);
 
       // Only care if that page message was recent (last 5 minutes)
       const lastPageMsgAge = now - new Date(lastPageMsg.created_time).getTime();
-      if (lastPageMsgAge > 5 * 60 * 1000) continue;
+      if (lastPageMsgAge > 5 * 60 * 1000) {
+        console.log(`  ⏰ Page msg too old`);
+        continue;
+      }
 
       // Check if it contains a handoff phrase
       const isHandoff = HANDOFF_KEYWORDS.some((kw) => lastPageMsg.message?.includes(kw));
+      console.log(`  🔑 Handoff detected: ${isHandoff}`);
       if (!isHandoff) continue;
 
       // Find the customer (first sender who is not the page)
