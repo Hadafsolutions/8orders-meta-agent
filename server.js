@@ -267,11 +267,16 @@ process.on("unhandledRejection", (reason) => {
   console.error("❌ Unhandled rejection:", reason);
 });
 
+async function startPolling() {
+  await pollForHandoffs();
+  // Use setTimeout (not setInterval) so next poll only starts after current one finishes
+  // This prevents concurrent polls from sending duplicate Discord notifications
+  setTimeout(startPolling, CONFIG.POLL_INTERVAL_MS);
+}
+
 app.listen(CONFIG.PORT, "0.0.0.0", async () => {
   console.log(`🚀 8Orders webhook server running on port ${CONFIG.PORT}`);
   await initPageId();
-  // Start polling immediately, then repeat every 60 seconds
-  await pollForHandoffs();
-  setInterval(pollForHandoffs, CONFIG.POLL_INTERVAL_MS);
   console.log(`🔍 Polling for Meta AI handoffs every ${CONFIG.POLL_INTERVAL_MS / 1000}s`);
+  startPolling();
 });
