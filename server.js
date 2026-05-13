@@ -165,7 +165,8 @@ async function pollForHandoffs() {
       if (!customerId) continue;
 
       console.log(`🔍 Poll detected handoff — customer: ${customerId}, convo: ${convo.id}`);
-      await handleMetaAIHandoff(customerId, convo.id);
+      // Pass the messages we already fetched so we don't need a second API call
+      await handleMetaAIHandoff(customerId, convo.id, messages);
     }
   } catch (err) {
     console.error("❌ Poll error:", err.response?.data || err.message);
@@ -174,9 +175,9 @@ async function pollForHandoffs() {
 
 // ─── Core logic ──────────────────────────────────────────────────────────────
 
-async function handleMetaAIHandoff(customerId, convoId = null) {
+async function handleMetaAIHandoff(customerId, convoId = null, cachedMessages = null) {
   try {
-    const history = await getConversationHistory(customerId);
+    const history = await getConversationHistory(customerId, convoId, cachedMessages);
     await sendDiscordNotification(customerId, history);
     // Only mark as notified AFTER Discord successfully received it
     if (convoId) notifiedConversations.set(convoId, Date.now());
@@ -187,20 +188,48 @@ async function handleMetaAIHandoff(customerId, convoId = null) {
   }
 }
 
-async function getConversationHistory(customerId) {
+async function getConversationHistory(customerId, convoId = null, cachedMessages = null) {
+  // Fetch customer name (best effort — fall back gracefully)
+  let profileName = `User ${customerId}`;
   try {
     const profileRes = await axios.get(`https://graph.facebook.com/v19.0/${customerId}`, {
       params: { fields: "name", access_token: CONFIG.PAGE_ACCESS_TOKEN },
     });
+    profileName = profileRes.data?.name || profileName;
+  } catch (err) {
+    console.log(`ℹ Could not fetch profile name for ${customerId}`);
+  }
+
+  // Use cached messages from poll if available (avoids a second API call)
+  if (cachedMessages && cachedMessages.length > 0) {
+    return { profile: { name: profileName }, messages: cachedMessages };
+  }
+
+  // Fallback: fetch messages directly using conversation ID
+  if (convoId) {
+    try {
+      const res = await axios.get(`https://graph.facebook.com/v19.0/${convoId}/messages`, {
+        params: { fields: "message,from,created_time", limit: 15, access_token: CONFIG.PAGE_ACCESS_TOKEN },
+      });
+      const messages = (res.data?.data || []).reverse();
+      return { profile: { name: profileName }, messages };
+    } catch (err) {
+      console.error("Error fetching convo by ID:", err.response?.data || err.message);
+    }
+  }
+
+  // Last resort: fetch by user_id
+  try {
     const convoRes = await axios.get(`https://graph.facebook.com/v19.0/me/conversations`, {
       params: { user_id: customerId, fields: "messages{message,from,created_time}", access_token: CONFIG.PAGE_ACCESS_TOKEN },
     });
-    const messages = convoRes.data?.data?.[0]?.messages?.data || [];
-    return { profile: profileRes.data, messages: messages.reverse() };
+    const messages = (convoRes.data?.data?.[0]?.messages?.data || []).reverse();
+    return { profile: { name: profileName }, messages };
   } catch (err) {
-    console.error("Error fetching conversation:", err.response?.data || err.message);
-    return { profile: { name: `User ${customerId}` }, messages: [] };
+    console.error("Error fetching convo by user_id:", err.response?.data || err.message);
   }
+
+  return { profile: { name: profileName }, messages: [] };
 }
 
 async function sendDiscordNotification(customerId, { profile, messages }) {
