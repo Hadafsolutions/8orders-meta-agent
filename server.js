@@ -12,6 +12,8 @@ const CONFIG = {
   DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1503757935199649904/goqYQiQnbPrEV4x4A8HRDwIdsO2361Cl3f2khuUTZ3G48j3pa9hFiUVz_irqlRZ4SHPc",
   PORT: process.env.PORT || 3000,
   POLL_INTERVAL_MS: 60 * 1000, // poll every 60 seconds
+  UPSTASH_URL: process.env.UPSTASH_REDIS_REST_URL,
+  UPSTASH_TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN,
 };
 
 // Phrases Meta AI uses when handing off to a human (Arabic + English system messages)
@@ -29,31 +31,76 @@ const HANDOFF_KEYWORDS = [
   "تحويلك",
 ];
 
-// Track notified conversations to avoid duplicate Discord pings
-// Map<conversationId, timestamp> — persisted to disk to survive restarts
-const NOTIFIED_FILE = "/tmp/notified_conversations.json";
-const notifiedConversations = new Map();
+// ─── Deduplication: Upstash Redis (persistent) with local Map fallback ────────
+// Upstash is preferred — survives Render restarts/redeploys.
+// Falls back to in-memory Map + /tmp file if Redis is not configured.
 
-function loadNotifiedConversations() {
+const USE_REDIS = !!(CONFIG.UPSTASH_URL && CONFIG.UPSTASH_TOKEN);
+const notifiedConversations = new Map(); // local fallback only
+const NOTIFIED_FILE = "/tmp/notified_conversations.json";
+
+function loadLocalFallback() {
+  if (USE_REDIS) return; // Redis handles persistence
   try {
     if (fs.existsSync(NOTIFIED_FILE)) {
       const data = JSON.parse(fs.readFileSync(NOTIFIED_FILE, "utf8"));
-      for (const [id, ts] of Object.entries(data)) {
-        notifiedConversations.set(id, ts);
-      }
+      for (const [id, ts] of Object.entries(data)) notifiedConversations.set(id, ts);
       console.log(`📂 Loaded ${notifiedConversations.size} notified conversations from disk`);
     }
   } catch (err) {
-    console.log("ℹ Could not load notified conversations file:", err.message);
+    console.log("ℹ Could not load notified file:", err.message);
   }
 }
 
-function saveNotifiedConversations() {
+function saveLocalFallback() {
   try {
     fs.writeFileSync(NOTIFIED_FILE, JSON.stringify(Object.fromEntries(notifiedConversations)), "utf8");
   } catch (err) {
-    console.log("ℹ Could not save notified conversations file:", err.message);
+    console.log("ℹ Could not save notified file:", err.message);
   }
+}
+
+async function isNotified(convoId) {
+  if (USE_REDIS) {
+    try {
+      const res = await axios.get(`${CONFIG.UPSTASH_URL}/get/notified:${convoId}`, {
+        headers: { Authorization: `Bearer ${CONFIG.UPSTASH_TOKEN}` },
+      });
+      return res.data.result !== null;
+    } catch (err) {
+      console.log("⚠️ Redis GET failed, using local fallback:", err.message);
+    }
+  }
+  return notifiedConversations.has(convoId);
+}
+
+async function markNotified(convoId) {
+  if (USE_REDIS) {
+    try {
+      // 7200 seconds = 2 hours TTL
+      await axios.post(
+        `${CONFIG.UPSTASH_URL}/set/notified:${convoId}/1/ex/7200`,
+        null,
+        { headers: { Authorization: `Bearer ${CONFIG.UPSTASH_TOKEN}` } }
+      );
+      console.log(`💾 Redis: marked ${convoId} as notified (2h TTL)`);
+      return;
+    } catch (err) {
+      console.log("⚠️ Redis SET failed, using local fallback:", err.message);
+    }
+  }
+  notifiedConversations.set(convoId, Date.now());
+  saveLocalFallback();
+}
+
+async function pruneLocalFallback() {
+  if (USE_REDIS) return;
+  const now = Date.now();
+  let pruned = false;
+  for (const [id, ts] of notifiedConversations) {
+    if (now - ts > 2 * 60 * 60 * 1000) { notifiedConversations.delete(id); pruned = true; }
+  }
+  if (pruned) saveLocalFallback();
 }
 
 let PAGE_ID = null;
@@ -136,12 +183,7 @@ async function pollForHandoffs() {
     const conversations = res.data?.data || [];
     const now = Date.now();
 
-    // Remove stale entries (older than 2 hours) to allow re-notification
-    let pruned = false;
-    for (const [id, ts] of notifiedConversations) {
-      if (now - ts > 2 * 60 * 60 * 1000) { notifiedConversations.delete(id); pruned = true; }
-    }
-    if (pruned) saveNotifiedConversations();
+    await pruneLocalFallback();
 
     console.log(`🔄 Poll: checking ${conversations.length} conversations`);
 
@@ -159,7 +201,7 @@ async function pollForHandoffs() {
       console.log(`  📬 Active convo ${convo.id} — ${messages.length} msgs, latest ${Math.round(latestMsgAge/1000)}s ago`);
 
       // Skip if we already notified for this conversation recently
-      if (notifiedConversations.has(convo.id)) {
+      if (await isNotified(convo.id)) {
         console.log(`  ⏭ Already notified`);
         continue;
       }
@@ -205,11 +247,8 @@ async function handleMetaAIHandoff(customerId, convoId = null, cachedMessages = 
   try {
     const history = await getConversationHistory(customerId, convoId, cachedMessages);
     await sendDiscordNotification(customerId, history);
-    // Only mark as notified AFTER Discord successfully received it, then persist to disk
-    if (convoId) {
-      notifiedConversations.set(convoId, Date.now());
-      saveNotifiedConversations();
-    }
+    // Only mark as notified AFTER Discord successfully received it
+    if (convoId) await markNotified(convoId);
     console.log("✅ Discord notified for customer", customerId);
   } catch (err) {
     console.error("❌ Error:", err.message);
@@ -305,7 +344,8 @@ async function startPolling() {
 
 app.listen(CONFIG.PORT, "0.0.0.0", async () => {
   console.log(`🚀 8Orders webhook server running on port ${CONFIG.PORT}`);
-  loadNotifiedConversations();
+  console.log(`💾 Storage: ${USE_REDIS ? "Upstash Redis (persistent)" : "local /tmp (ephemeral)"}`);
+  loadLocalFallback();
   await initPageId();
   console.log(`🔍 Polling for Meta AI handoffs every ${CONFIG.POLL_INTERVAL_MS / 1000}s`);
   startPolling();
