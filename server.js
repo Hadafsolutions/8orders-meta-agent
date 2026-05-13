@@ -165,8 +165,7 @@ async function pollForHandoffs() {
       if (!customerId) continue;
 
       console.log(`🔍 Poll detected handoff — customer: ${customerId}, convo: ${convo.id}`);
-      notifiedConversations.set(convo.id, now);
-      await handleMetaAIHandoff(customerId);
+      await handleMetaAIHandoff(customerId, convo.id);
     }
   } catch (err) {
     console.error("❌ Poll error:", err.response?.data || err.message);
@@ -175,13 +174,16 @@ async function pollForHandoffs() {
 
 // ─── Core logic ──────────────────────────────────────────────────────────────
 
-async function handleMetaAIHandoff(customerId) {
+async function handleMetaAIHandoff(customerId, convoId = null) {
   try {
     const history = await getConversationHistory(customerId);
     await sendDiscordNotification(customerId, history);
+    // Only mark as notified AFTER Discord successfully received it
+    if (convoId) notifiedConversations.set(convoId, Date.now());
     console.log("✅ Discord notified for customer", customerId);
   } catch (err) {
     console.error("❌ Error:", err.message);
+    // Do NOT mark as notified — allow retry on next poll
   }
 }
 
