@@ -13,8 +13,13 @@ const CONFIG = {
   POLL_INTERVAL_MS: 60 * 1000, // poll every 60 seconds
 };
 
-// Arabic phrases Meta AI uses when handing off to a human
+// Phrases Meta AI uses when handing off to a human (Arabic + English system messages)
 const HANDOFF_KEYWORDS = [
+  // English system messages (what the Graph API actually returns)
+  "Your AI agent transferred this chat to you",
+  "transferred this chat",
+  "agent transferred",
+  // Arabic phrases
   "سأقوم بتوصيلك",
   "بأحد ممثلي",
   "الدعم الفني",
