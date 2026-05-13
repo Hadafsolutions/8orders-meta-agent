@@ -1,5 +1,6 @@
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
 const app = express();
 app.use(express.json());
 
@@ -29,8 +30,31 @@ const HANDOFF_KEYWORDS = [
 ];
 
 // Track notified conversations to avoid duplicate Discord pings
-// Map<conversationId, timestamp>
+// Map<conversationId, timestamp> — persisted to disk to survive restarts
+const NOTIFIED_FILE = "/tmp/notified_conversations.json";
 const notifiedConversations = new Map();
+
+function loadNotifiedConversations() {
+  try {
+    if (fs.existsSync(NOTIFIED_FILE)) {
+      const data = JSON.parse(fs.readFileSync(NOTIFIED_FILE, "utf8"));
+      for (const [id, ts] of Object.entries(data)) {
+        notifiedConversations.set(id, ts);
+      }
+      console.log(`📂 Loaded ${notifiedConversations.size} notified conversations from disk`);
+    }
+  } catch (err) {
+    console.log("ℹ Could not load notified conversations file:", err.message);
+  }
+}
+
+function saveNotifiedConversations() {
+  try {
+    fs.writeFileSync(NOTIFIED_FILE, JSON.stringify(Object.fromEntries(notifiedConversations)), "utf8");
+  } catch (err) {
+    console.log("ℹ Could not save notified conversations file:", err.message);
+  }
+}
 
 let PAGE_ID = null;
 
@@ -113,9 +137,11 @@ async function pollForHandoffs() {
     const now = Date.now();
 
     // Remove stale entries (older than 2 hours) to allow re-notification
+    let pruned = false;
     for (const [id, ts] of notifiedConversations) {
-      if (now - ts > 2 * 60 * 60 * 1000) notifiedConversations.delete(id);
+      if (now - ts > 2 * 60 * 60 * 1000) { notifiedConversations.delete(id); pruned = true; }
     }
+    if (pruned) saveNotifiedConversations();
 
     console.log(`🔄 Poll: checking ${conversations.length} conversations`);
 
@@ -179,8 +205,11 @@ async function handleMetaAIHandoff(customerId, convoId = null, cachedMessages = 
   try {
     const history = await getConversationHistory(customerId, convoId, cachedMessages);
     await sendDiscordNotification(customerId, history);
-    // Only mark as notified AFTER Discord successfully received it
-    if (convoId) notifiedConversations.set(convoId, Date.now());
+    // Only mark as notified AFTER Discord successfully received it, then persist to disk
+    if (convoId) {
+      notifiedConversations.set(convoId, Date.now());
+      saveNotifiedConversations();
+    }
     console.log("✅ Discord notified for customer", customerId);
   } catch (err) {
     console.error("❌ Error:", err.message);
@@ -276,6 +305,7 @@ async function startPolling() {
 
 app.listen(CONFIG.PORT, "0.0.0.0", async () => {
   console.log(`🚀 8Orders webhook server running on port ${CONFIG.PORT}`);
+  loadNotifiedConversations();
   await initPageId();
   console.log(`🔍 Polling for Meta AI handoffs every ${CONFIG.POLL_INTERVAL_MS / 1000}s`);
   startPolling();
