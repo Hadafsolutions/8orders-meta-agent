@@ -144,9 +144,17 @@ app.get("/debug-poll", async (_req, res) => {
       const msgs = (c.messages?.data || []).slice().reverse();
       const latest = msgs[msgs.length - 1];
       const age = latest ? Math.round((now - new Date(latest.created_time).getTime()) / 1000) : null;
-      const pageMsg = msgs.filter(m => m.from?.id === PAGE_ID).pop();
-      const handoff = HANDOFF_KEYWORDS.some(kw => pageMsg?.message?.includes(kw));
-      return { id: c.id, msgs: msgs.length, latestAge: `${age}s`, lastPageMsg: pageMsg?.message?.substring(0, 60) || null, handoff };
+      const handoffMsg = msgs
+        .filter(m => (now - new Date(m.created_time).getTime()) <= 5 * 60 * 1000)
+        .find(m => HANDOFF_KEYWORDS.some(kw => m.message?.includes(kw)));
+      return {
+        id: c.id,
+        msgs: msgs.length,
+        latestAge: `${age}s`,
+        handoff: !!handoffMsg,
+        handoffFrom: handoffMsg?.from?.id || (handoffMsg ? "system" : null),
+        handoffMsg: handoffMsg?.message?.substring(0, 60) || null,
+      };
     });
     res.json({ pageId: PAGE_ID, conversations: report });
   } catch (err) {
@@ -260,26 +268,17 @@ async function pollForHandoffs() {
         continue;
       }
 
-      // Find the most recent message sent BY THE PAGE (Meta AI)
-      const pageMessages = messages.filter((m) => m.from?.id === PAGE_ID);
-      if (pageMessages.length === 0) {
-        console.log(`  ℹ No page messages found`);
+      // Scan ALL recent messages for handoff keywords — the transfer system message
+      // is sent by the Meta AI agent, which has a different sender ID than PAGE_ID
+      const recentHandoffMsg = messages
+        .filter((m) => (now - new Date(m.created_time).getTime()) <= 5 * 60 * 1000)
+        .find((m) => HANDOFF_KEYWORDS.some((kw) => m.message?.includes(kw)));
+
+      if (!recentHandoffMsg) {
+        console.log(`  ℹ No recent handoff message found`);
         continue;
       }
-      const lastPageMsg = pageMessages[pageMessages.length - 1];
-      console.log(`  📝 Last page msg (${Math.round((now - new Date(lastPageMsg.created_time).getTime())/1000)}s ago): "${lastPageMsg.message?.substring(0, 80)}"`);
-
-      // Only care if that page message was recent (last 5 minutes)
-      const lastPageMsgAge = now - new Date(lastPageMsg.created_time).getTime();
-      if (lastPageMsgAge > 5 * 60 * 1000) {
-        console.log(`  ⏰ Page msg too old`);
-        continue;
-      }
-
-      // Check if it contains a handoff phrase
-      const isHandoff = HANDOFF_KEYWORDS.some((kw) => lastPageMsg.message?.includes(kw));
-      console.log(`  🔑 Handoff detected: ${isHandoff}`);
-      if (!isHandoff) continue;
+      console.log(`  🔑 Handoff detected: "${recentHandoffMsg.message?.substring(0, 80)}" (from: ${recentHandoffMsg.from?.id || "system"}`);
 
       console.log(`🔍 Poll detected handoff — customer: ${customerId}, convo: ${convo.id}`);
       // Pass the messages we already fetched so we don't need a second API call
