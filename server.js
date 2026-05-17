@@ -9,7 +9,7 @@ app.get("/", (_req, res) => res.status(200).send("OK"));
 const CONFIG = {
   VERIFY_TOKEN: process.env.VERIFY_TOKEN || "8orders_meta_verify_2024",
   PAGE_ACCESS_TOKEN: process.env.PAGE_ACCESS_TOKEN,
-  DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1503757935199649904/goqYQiQnbPrEV4x4A8HRDwIdsO2361Cl3f2khuUTZ3G48j3pa9hFiUVz_irqlRZ4SHPc",
+  DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || "https://discord.com/api/webhooks/1503757935199649904/goqYQiQnbPrEV4x4A8HRDwIdsO2361Cl3f2khuUTZ3G48j3pa9hFiUVz_irqlRZ4SHPc",
   PORT: process.env.PORT || 3000,
   POLL_INTERVAL_MS: 60 * 1000, // poll every 60 seconds
   UPSTASH_URL: process.env.UPSTASH_REDIS_REST_URL,
@@ -249,8 +249,13 @@ async function pollForHandoffs() {
 
       console.log(`  📬 Active convo ${convo.id} — ${messages.length} msgs, latest ${Math.round(latestMsgAge/1000)}s ago`);
 
-      // Skip if we already notified for this conversation recently
-      if (await isNotified(convo.id)) {
+      // Skip if we already notified for this customer recently (keyed by customerId,
+      // not convoId, so webhook-triggered notifications also prevent poll re-fires)
+      const customerMsg = messages.find((m) => m.from?.id !== PAGE_ID);
+      const customerId = customerMsg?.from?.id;
+      if (!customerId) continue;
+
+      if (await isNotified(customerId)) {
         console.log(`  ⏭ Already notified`);
         continue;
       }
@@ -276,11 +281,6 @@ async function pollForHandoffs() {
       console.log(`  🔑 Handoff detected: ${isHandoff}`);
       if (!isHandoff) continue;
 
-      // Find the customer (first sender who is not the page)
-      const customerMsg = messages.find((m) => m.from?.id !== PAGE_ID);
-      const customerId = customerMsg?.from?.id;
-      if (!customerId) continue;
-
       console.log(`🔍 Poll detected handoff — customer: ${customerId}, convo: ${convo.id}`);
       // Pass the messages we already fetched so we don't need a second API call
       await handleMetaAIHandoff(customerId, convo.id, messages);
@@ -296,8 +296,8 @@ async function handleMetaAIHandoff(customerId, convoId = null, cachedMessages = 
   try {
     const history = await getConversationHistory(customerId, convoId, cachedMessages);
     await sendDiscordNotification(customerId, history);
-    // Only mark as notified AFTER Discord successfully received it
-    if (convoId) await markNotified(convoId);
+    // Mark by customerId so both poll and webhook paths share the same dedup key
+    await markNotified(customerId);
     console.log("✅ Discord notified for customer", customerId);
   } catch (err) {
     console.error("❌ Error:", err.message);
