@@ -37,7 +37,9 @@ const HANDOFF_KEYWORDS = [
 
 const USE_REDIS = !!(CONFIG.UPSTASH_URL && CONFIG.UPSTASH_TOKEN);
 const notifiedConversations = new Map(); // local fallback only
+const awaitingInfoMap = new Map();       // local fallback: customers we asked but haven't replied yet
 const NOTIFIED_FILE = "/tmp/notified_conversations.json";
+const AWAIT_TIMEOUT_MS = 10 * 60 * 1000; // wait up to 10 min for customer reply
 
 function loadLocalFallback() {
   if (USE_REDIS) return; // Redis handles persistence
@@ -91,6 +93,70 @@ async function markNotified(convoId) {
   }
   notifiedConversations.set(convoId, Date.now());
   saveLocalFallback();
+}
+
+// ─── Awaiting-info state: Redis + local Map ───────────────────────────────────
+// Tracks customers we've asked for order/phone but haven't replied yet.
+// Value = unix timestamp of when we asked (used to detect timeout + find reply).
+
+async function getAwaiting(customerId) {
+  if (USE_REDIS) {
+    try {
+      const res = await axios.get(`${CONFIG.UPSTASH_URL}/get/awaiting:${customerId}`, {
+        headers: { Authorization: `Bearer ${CONFIG.UPSTASH_TOKEN}` },
+      });
+      return res.data.result !== null ? Number(res.data.result) : null;
+    } catch (err) {
+      console.log("⚠️ Redis GET awaiting failed:", err.message);
+    }
+  }
+  return awaitingInfoMap.get(customerId) || null;
+}
+
+async function setAwaiting(customerId) {
+  const ts = Date.now();
+  if (USE_REDIS) {
+    try {
+      await axios.post(
+        `${CONFIG.UPSTASH_URL}/set/awaiting:${customerId}/${ts}/ex/600`,
+        null,
+        { headers: { Authorization: `Bearer ${CONFIG.UPSTASH_TOKEN}` } }
+      );
+      console.log(`⏳ Redis: awaiting info from ${customerId}`);
+      return;
+    } catch (err) {
+      console.log("⚠️ Redis SET awaiting failed:", err.message);
+    }
+  }
+  awaitingInfoMap.set(customerId, ts);
+}
+
+async function clearAwaiting(customerId) {
+  if (USE_REDIS) {
+    try {
+      await axios.post(`${CONFIG.UPSTASH_URL}/del/awaiting:${customerId}`, null, {
+        headers: { Authorization: `Bearer ${CONFIG.UPSTASH_TOKEN}` },
+      });
+      return;
+    } catch (err) {
+      console.log("⚠️ Redis DEL awaiting failed:", err.message);
+    }
+  }
+  awaitingInfoMap.delete(customerId);
+}
+
+// ─── Send contact-info request to customer via Messenger ─────────────────────
+
+async function askForContactInfo(customerId) {
+  const text =
+    "شكراً لتواصلك معنا 🙏\n" +
+    "لكي يتمكن فريقنا من مساعدتك بسرعة، يرجى مشاركة رقم طلبك أو رقم هاتفك.";
+  await axios.post(
+    "https://graph.facebook.com/v19.0/me/messages",
+    { recipient: { id: customerId }, message: { text } },
+    { params: { access_token: CONFIG.PAGE_ACCESS_TOKEN } }
+  );
+  console.log(`📤 Asked ${customerId} for order/phone number`);
 }
 
 async function pruneLocalFallback() {
@@ -282,9 +348,36 @@ async function pollForHandoffs() {
       }
       console.log(`  🔑 Handoff detected: "${handoffMsg.message?.substring(0, 80)}" (from: ${handoffMsg.from?.id || "system"})`);
 
-      console.log(`🔍 Poll detected handoff — customer: ${customerId}, convo: ${convo.id}`);
-      // Pass the messages we already fetched so we don't need a second API call
-      await handleMetaAIHandoff(customerId, convo.id, messages);
+      // ── Ask-first flow ────────────────────────────────────────────────────
+      const awaitedAt = await getAwaiting(customerId);
+
+      if (awaitedAt) {
+        // We already asked — look for a customer reply AFTER we sent the question
+        const customerReplies = messages.filter(
+          (m) => m.from?.id === customerId &&
+                 new Date(m.created_time).getTime() > awaitedAt
+        );
+
+        if (customerReplies.length > 0) {
+          // Customer replied — extract their contact info
+          const contactInfo = customerReplies.map((m) => m.message).filter(Boolean).join(" | ");
+          console.log(`📋 Customer provided info: "${contactInfo}"`);
+          await clearAwaiting(customerId);
+          await handleMetaAIHandoff(customerId, convo.id, messages, contactInfo);
+        } else if (now - awaitedAt > AWAIT_TIMEOUT_MS) {
+          // Timed out — notify Discord without contact info
+          console.log(`⏰ No reply from ${customerId} after 10 min — notifying without contact info`);
+          await clearAwaiting(customerId);
+          await handleMetaAIHandoff(customerId, convo.id, messages, null);
+        } else {
+          console.log(`  ⏳ Waiting for ${customerId} to share order/phone (${Math.round((now - awaitedAt) / 1000)}s elapsed)`);
+        }
+      } else {
+        // First detection — ask customer for order/phone before notifying Discord
+        console.log(`🔍 Poll detected handoff — asking ${customerId} for contact info first`);
+        await askForContactInfo(customerId);
+        await setAwaiting(customerId);
+      }
     }
   } catch (err) {
     console.error("❌ Poll error:", err.response?.data || err.message);
@@ -293,10 +386,10 @@ async function pollForHandoffs() {
 
 // ─── Core logic ──────────────────────────────────────────────────────────────
 
-async function handleMetaAIHandoff(customerId, convoId = null, cachedMessages = null) {
+async function handleMetaAIHandoff(customerId, convoId = null, cachedMessages = null, contactInfo = null) {
   try {
     const history = await getConversationHistory(customerId, convoId, cachedMessages);
-    await sendDiscordNotification(customerId, history);
+    await sendDiscordNotification(customerId, history, contactInfo);
     // Mark by customerId so both poll and webhook paths share the same dedup key
     await markNotified(customerId);
     console.log("✅ Discord notified for customer", customerId);
@@ -350,7 +443,7 @@ async function getConversationHistory(customerId, convoId = null, cachedMessages
   return { profile: { name: profileName }, messages: [] };
 }
 
-async function sendDiscordNotification(customerId, { profile, messages }) {
+async function sendDiscordNotification(customerId, { profile, messages }, contactInfo = null) {
   const customerName = profile?.name || `User ${customerId}`;
   const timestamp = new Date().toLocaleString("ar-EG", { timeZone: "Africa/Cairo", dateStyle: "medium", timeStyle: "short" });
   const historyText = messages.slice(-15).map((msg) => {
@@ -360,19 +453,26 @@ async function sendDiscordNotification(customerId, { profile, messages }) {
     return `**${sender}** *(${time})*\n${msg.message || "[media]"}`;
   }).join("\n\n");
 
+  const fields = [
+    { name: "👤 Customer", value: customerName, inline: true },
+    { name: "🆔 ID", value: `\`${customerId}\``, inline: true },
+    { name: "🕐 Time", value: timestamp, inline: true },
+    {
+      name: contactInfo ? "📋 Order / Phone" : "📋 Order / Phone",
+      value: contactInfo || "❌ No reply provided",
+      inline: false,
+    },
+    { name: "📝 Conversation", value: historyText || "No messages available" },
+    { name: "🔗 Open Chat", value: `[Click here to reply](https://www.facebook.com/messages/t/${customerId})` },
+  ];
+
   await axios.post(CONFIG.DISCORD_WEBHOOK_URL, {
     username: "8Orders AI Agent",
     embeds: [{
       title: "🚨 Customer needs human support",
       description: "Meta AI couldn't respond — manual intervention needed",
-      color: 0xff4444,
-      fields: [
-        { name: "👤 Customer", value: customerName, inline: true },
-        { name: "🆔 ID", value: `\`${customerId}\``, inline: true },
-        { name: "🕐 Time", value: timestamp, inline: true },
-        { name: "📝 Conversation", value: historyText || "No messages available" },
-        { name: "🔗 Open Chat", value: `[Click here to reply](https://www.facebook.com/messages/t/${customerId})` },
-      ],
+      color: contactInfo ? 0xff8800 : 0xff4444, // orange if info provided, red if not
+      fields,
       footer: { text: "8Orders Support System • Meta AI Handoff" },
       timestamp: new Date().toISOString(),
     }],
