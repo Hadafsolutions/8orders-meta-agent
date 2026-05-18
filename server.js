@@ -133,7 +133,7 @@ app.get("/debug-poll", async (_req, res) => {
   try {
     const result = await axios.get("https://graph.facebook.com/v19.0/me/conversations", {
       params: {
-        fields: "id,messages.limit(5){message,from,created_time}",
+        fields: "id,messages.limit(20){message,from,created_time}",
         access_token: CONFIG.PAGE_ACCESS_TOKEN,
         limit: 10,
       },
@@ -145,7 +145,6 @@ app.get("/debug-poll", async (_req, res) => {
       const latest = msgs[msgs.length - 1];
       const age = latest ? Math.round((now - new Date(latest.created_time).getTime()) / 1000) : null;
       const handoffMsg = msgs
-        .filter(m => (now - new Date(m.created_time).getTime()) <= 5 * 60 * 1000)
         .find(m => HANDOFF_KEYWORDS.some(kw => m.message?.includes(kw)));
       return {
         id: c.id,
@@ -231,7 +230,7 @@ async function pollForHandoffs() {
   try {
     const res = await axios.get("https://graph.facebook.com/v19.0/me/conversations", {
       params: {
-        fields: "id,messages.limit(10){message,from,created_time}",
+        fields: "id,messages.limit(20){message,from,created_time}",
         access_token: CONFIG.PAGE_ACCESS_TOKEN,
         limit: 25,
       },
@@ -268,17 +267,20 @@ async function pollForHandoffs() {
         continue;
       }
 
-      // Scan ALL recent messages for handoff keywords — the transfer system message
-      // is sent by the Meta AI agent, which has a different sender ID than PAGE_ID
-      const recentHandoffMsg = messages
-        .filter((m) => (now - new Date(m.created_time).getTime()) <= 5 * 60 * 1000)
+      // Scan ALL fetched messages for handoff keywords — no time-limit on the
+      // handoff message itself because:
+      //   1. API lag can cause the first poll to miss it, making the next poll see
+      //      it as >5 min old and skip it (intermittent miss bug)
+      //   2. Customer follow-up messages can push the handoff beyond a small limit
+      // The 2h dedup (isNotified/markNotified) prevents duplicate notifications.
+      const handoffMsg = messages
         .find((m) => HANDOFF_KEYWORDS.some((kw) => m.message?.includes(kw)));
 
-      if (!recentHandoffMsg) {
-        console.log(`  ℹ No recent handoff message found`);
+      if (!handoffMsg) {
+        console.log(`  ℹ No handoff message found`);
         continue;
       }
-      console.log(`  🔑 Handoff detected: "${recentHandoffMsg.message?.substring(0, 80)}" (from: ${recentHandoffMsg.from?.id || "system"}`);
+      console.log(`  🔑 Handoff detected: "${handoffMsg.message?.substring(0, 80)}" (from: ${handoffMsg.from?.id || "system"})`);
 
       console.log(`🔍 Poll detected handoff — customer: ${customerId}, convo: ${convo.id}`);
       // Pass the messages we already fetched so we don't need a second API call
