@@ -145,6 +145,25 @@ async function clearAwaiting(customerId) {
   awaitingInfoMap.delete(customerId);
 }
 
+// ─── Unified handoff entry-point (used by both webhook + poll) ───────────────
+// Starts the ask-first flow if not already in progress.
+// The poll loop handles checking for the reply and notifying Discord.
+
+async function initiateHandoffFlow(customerId) {
+  if (await isNotified(customerId)) {
+    console.log(`⏭ Already notified ${customerId} — skipping`);
+    return;
+  }
+  const awaitedAt = await getAwaiting(customerId);
+  if (awaitedAt) {
+    console.log(`⏳ Already awaiting info from ${customerId} — poll will handle reply`);
+    return;
+  }
+  console.log(`🔍 Initiating handoff flow for ${customerId} — asking for contact info`);
+  await askForContactInfo(customerId);
+  await setAwaiting(customerId);
+}
+
 // ─── Send contact-info request to customer via Messenger ─────────────────────
 
 async function askForContactInfo(customerId) {
@@ -257,7 +276,7 @@ app.post("/webhook", async (req, res) => {
         if (event.pass_thread_control || event.take_thread_control) {
           const type = event.pass_thread_control ? "pass_thread_control" : "take_thread_control";
           console.log(`🚨 Handoff (${type})! Customer:`, event.sender?.id);
-          await handleMetaAIHandoff(event.sender.id);
+          await initiateHandoffFlow(event.sender.id);
         }
 
         // Message echo from Meta AI (backup detection)
@@ -267,7 +286,7 @@ app.post("/webhook", async (req, res) => {
           if (isHandoff) {
             const customerId = event.recipient?.id;
             console.log("🚨 Handoff via echo! Customer:", customerId);
-            await handleMetaAIHandoff(customerId);
+            await initiateHandoffFlow(customerId);
           }
         }
       }
@@ -374,9 +393,7 @@ async function pollForHandoffs() {
         }
       } else {
         // First detection — ask customer for order/phone before notifying Discord
-        console.log(`🔍 Poll detected handoff — asking ${customerId} for contact info first`);
-        await askForContactInfo(customerId);
-        await setAwaiting(customerId);
+        await initiateHandoffFlow(customerId);
       }
     }
   } catch (err) {
