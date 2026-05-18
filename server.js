@@ -118,7 +118,7 @@ async function setAwaiting(customerId) {
   if (USE_REDIS) {
     try {
       await axios.post(
-        `${CONFIG.UPSTASH_URL}/set/awaiting:${customerId}/${ts}/ex/600`,
+        `${CONFIG.UPSTASH_URL}/set/awaiting:${customerId}/${ts}/ex/1800`,
         null,
         { headers: { Authorization: `Bearer ${CONFIG.UPSTASH_TOKEN}` } }
       );
@@ -218,7 +218,7 @@ app.get("/debug-poll", async (_req, res) => {
   try {
     const result = await axios.get("https://graph.facebook.com/v19.0/me/conversations", {
       params: {
-        fields: "id,messages.limit(20){message,from,created_time}",
+        fields: "id,messages.limit(30){message,from,created_time}",
         access_token: CONFIG.PAGE_ACCESS_TOKEN,
         limit: 10,
       },
@@ -315,7 +315,7 @@ async function pollForHandoffs() {
   try {
     const res = await axios.get("https://graph.facebook.com/v19.0/me/conversations", {
       params: {
-        fields: "id,messages.limit(20){message,from,created_time}",
+        fields: "id,messages.limit(30){message,from,created_time}",
         access_token: CONFIG.PAGE_ACCESS_TOKEN,
         limit: 25,
       },
@@ -368,32 +368,49 @@ async function pollForHandoffs() {
       console.log(`  🔑 Handoff detected: "${handoffMsg.message?.substring(0, 80)}" (from: ${handoffMsg.from?.id || "system"})`);
 
       // ── Ask-first flow ────────────────────────────────────────────────────
-      const awaitedAt = await getAwaiting(customerId);
+      // Primary: find our own question message in the conversation.
+      // This is more reliable than Redis timestamps — works even if Redis TTL
+      // expired or the first poll had a lag. Redis is used only as a short lock
+      // to prevent duplicate asks between poll cycles.
+      const ourQuestion = messages.find(
+        (m) => m.from?.id !== customerId &&
+               m.message?.includes("شكراً لتواصلك معنا 🙏")
+      );
 
-      if (awaitedAt) {
-        // We already asked — look for a customer reply AFTER we sent the question
+      if (ourQuestion) {
+        // Our question is in the conversation — use its timestamp as the anchor
+        const questionTime = new Date(ourQuestion.created_time).getTime();
         const customerReplies = messages.filter(
           (m) => m.from?.id === customerId &&
-                 new Date(m.created_time).getTime() > awaitedAt
+                 new Date(m.created_time).getTime() > questionTime
         );
 
         if (customerReplies.length > 0) {
-          // Customer replied — extract their contact info
           const contactInfo = customerReplies.map((m) => m.message).filter(Boolean).join(" | ");
           console.log(`📋 Customer provided info: "${contactInfo}"`);
           await clearAwaiting(customerId);
           await handleMetaAIHandoff(customerId, convo.id, messages, contactInfo);
-        } else if (now - awaitedAt > AWAIT_TIMEOUT_MS) {
-          // Timed out — notify Discord without contact info
+        } else if (now - questionTime > AWAIT_TIMEOUT_MS) {
           console.log(`⏰ No reply from ${customerId} after 10 min — notifying without contact info`);
           await clearAwaiting(customerId);
           await handleMetaAIHandoff(customerId, convo.id, messages, null);
         } else {
-          console.log(`  ⏳ Waiting for ${customerId} to share order/phone (${Math.round((now - awaitedAt) / 1000)}s elapsed)`);
+          console.log(`  ⏳ Waiting for reply (${Math.round((now - questionTime) / 1000)}s elapsed)`);
         }
       } else {
-        // First detection — ask customer for order/phone before notifying Discord
-        await initiateHandoffFlow(customerId);
+        // Our question not in fetched window — fall back to Redis for state
+        const awaitedAt = await getAwaiting(customerId);
+        if (awaitedAt && now - awaitedAt > AWAIT_TIMEOUT_MS) {
+          // Redis says we asked >10 min ago but question is out of range — send without info
+          console.log(`⏰ Timeout (question outside fetch window) — notifying without contact info`);
+          await clearAwaiting(customerId);
+          await handleMetaAIHandoff(customerId, convo.id, messages, null);
+        } else if (!awaitedAt) {
+          // Never asked — ask now
+          await initiateHandoffFlow(customerId);
+        } else {
+          console.log(`  ⏳ Waiting (question outside fetch window, ${Math.round((now - awaitedAt) / 1000)}s elapsed)`);
+        }
       }
     }
   } catch (err) {
